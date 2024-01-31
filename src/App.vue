@@ -13,6 +13,7 @@
         duration: number;
         width: number;
         height: number;
+        progress: number;
     }
 
     const durationRegex = /^(.*)Duration:\s([0-9\.:]+)(.*)$/;
@@ -24,26 +25,29 @@
         duration: 0,
         width: 0,
         height: 0,
+        progress: 0,
     });
 
     ffmpeg.setLogger(({ type, message }) => {
-        if (
-            videoInfo.value.valid === null &&
-            message.includes("Invalid data found when processing input")
-        )
+        console.log(message);
+
+        if (videoInfo.value.valid === null && message.includes("Invalid data found when processing input")){
             videoInfo.value.valid = false;
+
+            return;
+        }
 
         if (videoInfo.value.duration === 0 && durationRegex.test(message)) {
             const duration = message.replace(durationRegex, "$2");
-            const [hms, ms] = duration.split(".");
-            const [hours, minutes, seconds] = hms.split(":");
+            const [hours, minutes, seconds] = duration.split(":");
 
             videoInfo.value.duration =
-                parseInt(hours) * 60 * 60 +
-                parseInt(minutes) * 60 +
-                parseInt(seconds) * 1 +
-                parseInt(ms) / 100;
-            videoInfo.value.valid = videoInfo.value.duration > 0.1;
+                parseInt(hours) * 360000 +
+                parseInt(minutes) * 6000 +
+                parseFloat(seconds) * 100;
+            videoInfo.value.valid = videoInfo.value.duration >= 1;
+
+            return;
         }
 
         if (videoInfo.value.width === 0 && resolutionRegex.test(message)) {
@@ -52,46 +56,55 @@
 
             videoInfo.value.width = parseInt(width);
             videoInfo.value.height = parseInt(height);
-        }
 
-        console.log(message);
+            return;
+        }
+    });
+
+    ffmpeg.setProgress(({ ratio }) => {
+        videoInfo.value.progress = ratio;
+        progressEvent(ratio);
     });
 
     const loading = ref<string | null>();
     const selectedFile = ref<File>();
     const thumbnailFrom = ref<string>();
     const thumbnailTo = ref<string>();
-    const cutFrom = ref<number>(0);
-    const cutTo = ref<number>(0);
+    const cutStartTime = ref<number>();
+    const cutEndTime = ref<number>();
     const inputFileName = "INPUTFILE";
 
-    const getThumbnail = async (startTime: number) => {
+    const getThumbnail = async (time: number) => {
         if (videoInfo.value.valid !== true || !ffmpeg.isLoaded()) return;
 
         const outputFileName = randomFileName("png");
 
         await ffmpeg.run(
             "-ss",
-            String(startTime),
+            String(time / 100),
             "-i",
             inputFileName,
             "-vframes",
             "1",
             outputFileName
         );
-        const data = ffmpeg.FS("readFile", outputFileName);
-        const url = URL.createObjectURL(
-            new Blob([data.buffer], { type: "image/png" })
-        );
 
-        ffmpeg.FS("unlink", outputFileName);
+        try {
+            const data = ffmpeg.FS("readFile", outputFileName);
+            const url = URL.createObjectURL(
+                new Blob([data.buffer], { type: "image/png" })
+            );
 
-        return url;
+            ffmpeg.FS("unlink", outputFileName);
+
+            return url;
+        } catch (e) {
+            return `http://via.placeholder.com/${videoInfo.value.width}x${videoInfo.value.height}`;
+        }
     };
 
     const selected = async (file: File) => {
         selectedFile.value = file;
-        //inputFileName = "input." + getExtension(file.name);
 
         loading.value = "Reading file...";
         if (!ffmpeg.isLoaded()) await ffmpeg.load();
@@ -108,27 +121,71 @@
 
         loading.value = "Making Thumbnail...";
         thumbnailFrom.value = await getThumbnail(0);
-        thumbnailTo.value = await getThumbnail(videoInfo.value.duration - 0.1);
+        thumbnailTo.value = await getThumbnail(videoInfo.value.duration - 10);
 
         loading.value = null;
     };
 
-    const video = ref<string>("");
+    const changeStartTime = async (startTime: number) => {
+        thumbnailFrom.value = await getThumbnail(startTime);
+    };
+
+    const changeEndTime = async (endTime: number) => {
+        thumbnailTo.value = await getThumbnail(endTime);
+    };
+
+    const cutFormNextStep = async (startTime: number, endTime: number) => {
+        cutStartTime.value = startTime;
+        cutEndTime.value = endTime;
+
+        const video = await convert();
+
+        loading.value = "";
+
+        if (!video) {
+            alert("An error occurred while encoding the video.");
+            cutStartTime.value = undefined;
+            cutEndTime.value = undefined;
+
+            return;
+        }
+
+        const link = document.createElement('a');
+        link.href = video;
+        link.download = "test.mp4";
+        link.click();
+        link.remove();
+    };
 
     const convert = async () => {
-        const file = selectedFile.value;
+        if (cutStartTime.value === undefined || cutEndTime.value === undefined || !ffmpeg.isLoaded()) return;
 
-        await ffmpeg.run("-i", "test.avi", "test.mp4");
-        const data = ffmpeg.FS("readFile", "test.mp4");
-        video.value = URL.createObjectURL(
+        const outputFileName = randomFileName("mp4");
+
+        await ffmpeg.run(
+            "-ss",
+            String(cutStartTime.value / 100),
+            "-to",
+            String(cutEndTime.value / 100),
+            "-i",
+            inputFileName,
+            outputFileName
+        );
+
+        const data = ffmpeg.FS("readFile", outputFileName);
+        return URL.createObjectURL(
             new Blob([data.buffer], { type: "video/mp4" })
         );
     };
+
+    const progressEvent = (ratio: number) => {
+        if (cutStartTime.value === undefined || cutEndTime.value === undefined || !ffmpeg.isLoaded()) return;
+
+        loading.value = `Creating video... (${Math.round(ratio * 100)}%)`;
+    }
 </script>
 
 <template>
-    <vue-particles color="#dedede"></vue-particles>
-
     <Logo text="Video Editor" class="mt-8 mb-16" />
 
     <FileSelectForm
@@ -139,9 +196,12 @@
     <Loading class="mx-auto max-w-4xl" v-if="loading">{{ loading }}</Loading>
 
     <CutForm
-        v-if="thumbnailFrom && thumbnailTo"
+        v-if="thumbnailFrom && thumbnailTo && cutStartTime === undefined && cutEndTime === undefined"
         :thumbnailFrom="thumbnailFrom"
         :thumbnailTo="thumbnailTo"
         :duration="videoInfo.duration"
+        @changeStartTime="changeStartTime"
+        @changeEndTime="changeEndTime"
+        @nextStep="cutFormNextStep"
     />
 </template>
